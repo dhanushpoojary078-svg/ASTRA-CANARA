@@ -1,11 +1,84 @@
 #include "kvdb/database.hpp"
 #include "kvdb/cli/batch_parser.hpp"
+#include "kvdb/storage/format.hpp"
 #include "../torture/oracle.hpp"
+#include "../../src/storage/file_test_hooks.hpp"
 #include <cassert>
 #include <iostream>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+
+void test_durable_transactions_and_failures() {
+    const std::string test_db = "durable_transaction_test.db";
+    std::remove(test_db.c_str());
+
+    {
+        kvdb::Database db;
+        assert(kvdb::is_ok(db.open(test_db)));
+        assert(kvdb::is_ok(db.put("durable-put", "put-value")));
+        assert(kvdb::is_ok(db.put("durable-delete", "delete-me")));
+        assert(kvdb::is_ok(db.remove("durable-delete")));
+
+        const std::vector<kvdb::Operation> operations = {
+            {kvdb::Operation::Type::Put, "batch-one", "one"},
+            {kvdb::Operation::Type::Put, "batch-two", "two"},
+            {kvdb::Operation::Type::Delete, "durable-put", ""}
+        };
+        assert(kvdb::is_ok(db.batch(operations)));
+        assert(kvdb::is_ok(db.close()));
+    }
+
+    {
+        kvdb::Database db;
+        assert(kvdb::is_ok(db.open(test_db)));
+        assert(db.get("durable-delete").status == kvdb::Status::NotFound);
+        assert(db.get("durable-put").status == kvdb::Status::NotFound);
+        assert(db.get("batch-one").value == "one");
+        assert(db.get("batch-two").value == "two");
+        assert(kvdb::is_ok(db.close()));
+    }
+    std::remove(test_db.c_str());
+
+    const std::string failure_db = "failed_transaction_test.db";
+    std::remove(failure_db.c_str());
+    {
+        kvdb::Database db;
+        assert(kvdb::is_ok(db.open(failure_db)));
+
+        const std::vector<kvdb::Operation> partial_batch = {
+            {kvdb::Operation::Type::Put, "partial-one", "one"},
+            {kvdb::Operation::Type::Put, "partial-two", "two"}
+        };
+        kvdb::storage::testing::fail_next_file_operation(
+            kvdb::storage::testing::FileFailurePoint::Append,
+            kvdb::storage::calculate_frame_size(0, 0) + 5
+        );
+        assert(db.batch(partial_batch) == kvdb::Status::IoError);
+        assert(db.get("partial-one").status == kvdb::Status::NotFound);
+        assert(db.get("partial-two").status == kvdb::Status::NotFound);
+
+        kvdb::storage::testing::fail_next_file_operation(
+            kvdb::storage::testing::FileFailurePoint::Sync
+        );
+        assert(db.put("unsynced-put", "value") == kvdb::Status::IoError);
+        assert(db.get("unsynced-put").status == kvdb::Status::NotFound);
+
+        assert(kvdb::is_ok(db.put("after-rollback", "durable")));
+        assert(kvdb::is_ok(db.close()));
+    }
+    {
+        kvdb::Database db;
+        assert(kvdb::is_ok(db.open(failure_db)));
+        assert(db.get("partial-one").status == kvdb::Status::NotFound);
+        assert(db.get("partial-two").status == kvdb::Status::NotFound);
+        assert(db.get("unsynced-put").status == kvdb::Status::NotFound);
+        assert(db.get("after-rollback").value == "durable");
+        assert(kvdb::is_ok(db.close()));
+    }
+    std::remove(failure_db.c_str());
+    kvdb::storage::testing::clear_file_failure();
+}
 
 int main() {
     const std::string oracle_log = "oracle_unit_test.ack.log";
@@ -106,6 +179,7 @@ int main() {
     assert(kvdb::is_ok(db.close()));
 
     std::remove(test_db.c_str());
+    test_durable_transactions_and_failures();
     std::cout << "[Unit Test] All basic unit tests passed!\n";
     return 0;
 }
